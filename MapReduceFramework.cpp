@@ -15,6 +15,8 @@ enum stage_t {
     REDUCE_STAGE = 3
 };
 
+void mapworker(ThreadContext* context);
+
 class JobStateAtomic {
 /// This class is used to manage the state of a job in a thread-safe manner.
 /// It uses atomic operations to ensure stage, processed and total
@@ -68,7 +70,7 @@ struct JobContext {
 // each job goes through 3/4 stages so we need to keep all its info together
 // used internally to manage the job.
     const MapReduceClient* client; // Pointer to the client
-    Barrier barrier;
+    Barrier barrier; // to wait untill sort
     std::vector<std::thread> threads;
     std::vector<IntermediateVec> intermediateVecsForReduce; // vector of vectors - make sure it contains a sequence of pairs (k2, v2) where all keys are identical
     std::mutex join_mutex;      // Protects joining logic
@@ -79,7 +81,7 @@ struct JobContext {
     OutputVec* outputVec;
     std::atomic<int> next_input_index; // ensures each thread has unique input pair
     JobStateAtomic atomicState; // Manages state atomically
-    std::mutex state_mutex;
+    std::mutex output_mutex;
     std::atomic<int> totalIntermediaryPairs = 0;
     std::atomic<int> totalOutputPairs = 0;
     std::vector<ThreadContext>* threadContexts;
@@ -95,6 +97,19 @@ struct JobContext {
     void setJobState(stage_t stage, uint32_t processed, uint32_t total) {
         atomicState.set(stage, processed, total);
     }
+
+        // Constructor
+        JobContext(const MapReduceClient* client, const InputVec& inputVec,  OutputVec* outputVec, int multiThreadLevel): 
+        client(client),
+        barrier(multiThreadLevel),
+        inputVec(inputVec),
+        outputVec(outputVec),
+        next_input_index(0),
+        joined(false),
+        is_deleted(false),
+        totalIntermediaryPairs(0),
+        totalOutputPairs(0),
+        threadContexts(nullptr) {atomicState.set(MAP_STAGE, 0, inputVec.size());}
 };
 
 struct JobState {
@@ -130,14 +145,12 @@ void waitForJob(JobHandle job) {
 
 void closeJobHandle(JobHandle job) {
     auto* jobContext = static_cast<JobContext*>(job);
-    {
-        std::unique_lock<std::mutex> lock(jobContext->delete_mutex);
-        if (jobContext->is_deleted) {
-            return; // Already deleted
-        }
-        jobContext->is_deleted = true; // Mark as deleted
+    std::unique_lock<std::mutex> lock(jobContext->delete_mutex);
+    if (jobContext->is_deleted) {
+        return; // Already deleted
     }
     waitForJob(job); // Ensure the job is finished before cleanup
+    jobContext->is_deleted = true; // Mark as deleted
     delete jobContext->threadContexts; // Delete the threadContexts vector
     delete jobContext; // Delete the JobContext
 }
@@ -157,64 +170,64 @@ void emit2(K2* key, V2* value, void* context) {
     threadContext->intermediateVec.emplace_back(key, value); // add the pair to the intermediate vector
 
     // update the number of intermediary elements using atomic counter
-    int newCount = threadContext->job->totalIntermediaryPairs.fetch_add(1) + 1; // increment number of emitted pairs
-    int total = threadContext->job->inputVec.size(); // total number of input pairs
-    threadContext->job->atomicState.set(MAP_STAGE, newCount, total); // update the job state
+    threadContext->job->totalIntermediaryPairs.fetch_add(1); // increment number of emitted pairs
+
 }
-
-
 
 void emit3(K3* key, V3* value, void* context) {
-// the user calls this function while in reduce phase to emit output key-value pairs
-}
+    // The user calls this function in the reduce phase to emit output key-value pairs
     auto* threadContext = static_cast<ThreadContext*>(context);
-    static std::mutex output_mutex; // Mutex for thread safety
-    std::lock_guard<std::mutex> lock(output_mutex); // Lock the mutex
+    std::lock_guard<std::mutex> lock(threadContext->job->output_mutex); // Mutex is now per-job
 
     threadContext->job->outputVec->emplace_back(key, value);
-    int newCount = threadContext->job->totalOutputPairs.fetch_add(1) + 1; // increment number of emitted pairs
-    int total = threadContext->job->intermediateVecsForReduce.size(); // total number of input pairs
-    threadContext->job->atomicState.set(REDUCE_STAGE, newCount, total); // update the job state
+    threadContext->job->totalOutputPairs.fetch_add(1); // increment number of emitted pairs
 }
 
 
 JobHandle startMapReduceJob(const MapReduceClient& client,
-                            const InputVec& inputVec, OutputVec& outputVec,
-                            int multiThreadLevel) {
-    // initialize the job context
-    auto* jobHandle_ret = new JobContext(); // create a new job context
-    jobHandle_ret->inputVec = inputVec; // set the input vector
-    jobHandle_ret->outputVec = &outputVec; // set the output vector
-    jobHandle_ret->next_input_index = 0; // initialize the input index
-    jobHandle_ret->setJobState(MAP_STAGE, 0, inputVec.size()); // set the initial job state
-    jobHandle_ret->totalIntermediaryPairs = 0; // initialize the total intermediary pairs
-    jobHandle_ret->totalOutputPairs = 0; // initialize the total output pairs
-    jobHandle_ret->joined = false; // mark as not joined
-    jobHandle_ret->is_deleted = false; // mark as not deleted
-    jobHandle_ret->client = &client; // set the client
-    jobHandle_ret->barrier = Barrier(multiThreadLevel); // initialize the barrier
+    const InputVec& inputVec, OutputVec& outputVec,
+    int multiThreadLevel) {
+auto* jobContext = new JobContext(&client, inputVec, &outputVec, multiThreadLevel);
+if (!jobContext) {
+    exit(1); // change to the right error
+}
+auto* threadContexts = new std::vector<ThreadContext>(multiThreadLevel);
+if (!threadContexts) {
+    exit(1); // change to the right error
+}
+jobContext->threadContexts = threadContexts;
 
-    // Create the threads context
-    std::vector<ThreadContext>* threadContexts = new std::vector<ThreadContext>(multiThreadLevel); // make sure to delete it when done
-    jobHandle_ret->threadContext = threadContexts; // set the thread context
-
-    for (int i = 0; i < multiThreadLevel; ++i) {
-        (*threadContexts)[i].job = jobHandle_ret;
-        (*threadContexts)[i].thread_id = i;
-        jobHandle_ret->threads.emplace_back(mapworker, &(*threadContexts)[i]); // create a new thread for each context
-    }
-    return static_cast<JobHandle>(jobContext);
+for (int i = 0; i < multiThreadLevel; ++i) {
+(*threadContexts)[i].job = jobContext;
+(*threadContexts)[i].thread_id = i;
+jobContext->threads.emplace_back(mapworker, &(*threadContexts)[i]);
 }
 
+return static_cast<JobHandle>(jobContext);
+}
 
+void mapworker(ThreadContext* context) {
+    JobContext* job = context->job;
+    int index;
 
+    while ((index = job->next_input_index.fetch_add(1)) < job->inputVec.size()) {
+        const auto& pair = job->inputVec[index];
+        job->client->map(pair.first, pair.second, context);
 
+        job->atomicState.updateProcessed(index + 1);
+    }
+
+    std::sort(context->intermediateVec.begin(), context->intermediateVec.end(),
+        [](const IntermediatePair& a, const IntermediatePair& b) {
+            return *a.first < *b.first;
+        });
+
+    job->barrier.barrier();
+}
 
 
 //// what do we still need to do?
 // 1. Implement the sort and shuffle functions (operator < given by client(?))
-// 2. Implement the startMapReduceJob function
-// 3. Implement the barrier
 // 4. Implement the mapworker
 // 5. Implement the reduceWorker
 // (in 4 and 5 we save the old_value and give it to the cur thread)
