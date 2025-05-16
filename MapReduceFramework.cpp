@@ -239,7 +239,8 @@ void mapWorker(ThreadContext* threadContext) {
             std::cerr << "Error in map function: " << e.what() << std::endl;
             return;
         }
-        threadContext->job->setJobState(stage_t::MAP_STAGE, threadContext->job->totalIntermediaryPairs.fetch_add(1), threadContext->job->inputVec.size());
+        int processed = index + 1;
+        threadContext->job->setJobState(stage_t::MAP_STAGE, processed, threadContext->job->inputVec.size());
         index = threadContext->job->next_input_index.fetch_add(1);
     }
     // sorting the intermediate vector
