@@ -8,14 +8,15 @@
 #include <atomic>
 #include <cstdint>
 
-enum stage_t {
+enum class stage_t {
     UNDEFINED_STAGE = 0,
     MAP_STAGE = 1,
     SHUFFLE_STAGE = 2,
     REDUCE_STAGE = 3
 };
-
-void mapworker(ThreadContext* context);
+void mapWorker(ThreadContext* context);
+void shuffle(JobContext* jobContext);
+void reduceWorker(ThreadContext* context);
 
 class JobStateAtomic {
 /// This class is used to manage the state of a job in a thread-safe manner.
@@ -82,9 +83,9 @@ struct JobContext {
     std::atomic<int> next_input_index; // ensures each thread has unique input pair
     JobStateAtomic atomicState; // Manages state atomically
     std::mutex output_mutex;
-    std::atomic<int> totalIntermediaryPairs = 0;
-    std::atomic<int> totalOutputPairs = 0;
-    std::vector<ThreadContext>* threadContexts;
+    std::atomic<int> totalIntermediaryPairs;
+    std::atomic<int> totalOutputPairs;
+    std::vector<ThreadContext> threadContexts;
 
     // Helper to get the current JobState
     JobState getJobState() {
@@ -98,23 +99,28 @@ struct JobContext {
         atomicState.set(stage, processed, total);
     }
 
-        // Constructor
-        JobContext(const MapReduceClient* client, const InputVec& inputVec,  OutputVec* outputVec, int multiThreadLevel): 
-        client(client),
-        barrier(multiThreadLevel),
-        inputVec(inputVec),
-        outputVec(outputVec),
-        next_input_index(0),
-        joined(false),
-        is_deleted(false),
-        totalIntermediaryPairs(0),
-        totalOutputPairs(0),
-        threadContexts(nullptr) {atomicState.set(MAP_STAGE, 0, inputVec.size());}
+JobContext(const MapReduceClient* client, const InputVec& inputVec, OutputVec* outputVec, int multiThreadLevel)
+    : client(client),
+      barrier(multiThreadLevel),
+      inputVec(std::move(inputVec)),
+      outputVec(outputVec),
+      next_input_index(0),
+      joined(false),
+      is_deleted(false),
+      totalIntermediaryPairs(0),
+      totalOutputPairs(0),
+      threadContexts(multiThreadLevel)
+    {
+    // Initialize the job state
+    setJobState(stage_t::MAP_STAGE, 0, this->inputVec.size());
+    // Initialize intermediateVecsForReduce
+    intermediateVecsForReduce.resize(multiThreadLevel);
+}
 };
 
 struct JobState {
 // used to communicate the job's state to external functions or users
-    stage_t stage = static_cast<stage_t>{UNDEFINED_STAGE}; // always start with UNDEFINED_STAGE
+    stage_t stage = stage_t::UNDEFINED_STAGE; // always start with UNDEFINED_STAGE
     float percentage = 0.0f; // percentage of completion (0-100)
 };
 
@@ -144,6 +150,10 @@ void waitForJob(JobHandle job) {
 
 
 void closeJobHandle(JobHandle job) {
+    if (job == nullptr) {
+        return; // No job to close
+    }
+    // Make sure that all threads in MapReduce job finish execution before moving on.
     auto* jobContext = static_cast<JobContext*>(job);
     std::unique_lock<std::mutex> lock(jobContext->delete_mutex);
     if (jobContext->is_deleted) {
@@ -151,7 +161,6 @@ void closeJobHandle(JobHandle job) {
     }
     waitForJob(job); // Ensure the job is finished before cleanup
     jobContext->is_deleted = true; // Mark as deleted
-    delete jobContext->threadContexts; // Delete the threadContexts vector
     delete jobContext; // Delete the JobContext
 }
 
@@ -167,7 +176,7 @@ void emit2(K2* key, V2* value, void* context) {
 // the user calls this function while in map phase to emit intermediate key-value pairs
 // receives a pair k2,v2 and saves it in the intermediate vector given in context
     auto* threadContext = static_cast<ThreadContext*>(context); // assume context is a ThreadContext*
-    threadContext->intermediateVec.emplace_back(key, value); // add the pair to the intermediate vector
+    threadContext->intermediateVec.emplace_back(std::move(key), std::move(value));
 
     // update the number of intermediary elements using atomic counter
     threadContext->job->totalIntermediaryPairs.fetch_add(1); // increment number of emitted pairs
@@ -179,57 +188,164 @@ void emit3(K3* key, V3* value, void* context) {
     auto* threadContext = static_cast<ThreadContext*>(context);
     std::lock_guard<std::mutex> lock(threadContext->job->output_mutex); // Mutex is now per-job
 
-    threadContext->job->outputVec->emplace_back(key, value);
+    threadContext->job->outputVec->emplace_back(std::move(key), std::move(value));
     threadContext->job->totalOutputPairs.fetch_add(1); // increment number of emitted pairs
 }
 
 
 JobHandle startMapReduceJob(const MapReduceClient& client,
-    const InputVec& inputVec, OutputVec& outputVec,
-    int multiThreadLevel) {
-auto* jobContext = new JobContext(&client, inputVec, &outputVec, multiThreadLevel);
-if (!jobContext) {
-    exit(1); // change to the right error
-}
-auto* threadContexts = new std::vector<ThreadContext>(multiThreadLevel);
-if (!threadContexts) {
-    exit(1); // change to the right error
-}
-jobContext->threadContexts = threadContexts;
-
-for (int i = 0; i < multiThreadLevel; ++i) {
-(*threadContexts)[i].job = jobContext;
-(*threadContexts)[i].thread_id = i;
-jobContext->threads.emplace_back(mapworker, &(*threadContexts)[i]);
-}
-
-return static_cast<JobHandle>(jobContext);
-}
-
-void mapworker(ThreadContext* context) {
-    JobContext* job = context->job;
-    int index;
-
-    while ((index = job->next_input_index.fetch_add(1)) < job->inputVec.size()) {
-        const auto& pair = job->inputVec[index];
-        job->client->map(pair.first, pair.second, context);
-
-        job->atomicState.updateProcessed(index + 1);
+                            const InputVec& inputVec, OutputVec& outputVec,
+                            int multiThreadLevel) {
+    // Allocate and initialize JobContext
+    auto* jobContext = new JobContext(&client, inputVec, &outputVec, multiThreadLevel);
+    if (!jobContext) {
+        std::cerr << "Error: Failed to allocate memory for JobContext." << std::endl;
+        return nullptr;
     }
 
-    std::sort(context->intermediateVec.begin(), context->intermediateVec.end(),
-        [](const IntermediatePair& a, const IntermediatePair& b) {
-            return *a.first < *b.first;
-        });
+    // Initialize threadContexts and create threads
+    for (int i = 0; i < multiThreadLevel; ++i) {
+        if (i >= jobContext->threadContexts.size()) {
+            std::cerr << "Error: Invalid thread context index." << std::endl;
+            delete jobContext;
+            return nullptr;
+        }
+        jobContext->threadContexts[i].job = jobContext;
+        jobContext->threadContexts[i].thread_id = i;
 
-    job->barrier.barrier();
+        try {
+            jobContext->threads.emplace_back(mapWorker, &jobContext->threadContexts[i]);
+        } catch (const std::system_error& e) {
+            std::cerr << "Error: Failed to create thread " << i << ": " << e.what() << std::endl;
+            waitForJob(static_cast<JobHandle>(jobContext));
+            delete jobContext;
+            return nullptr;
+        }
+    }
+    return static_cast<JobHandle>(jobContext);
 }
 
 
-//// what do we still need to do?
-// 1. Implement the sort and shuffle functions (operator < given by client(?))
-// 4. Implement the mapworker
-// 5. Implement the reduceWorker
-// (in 4 and 5 we save the old_value and give it to the cur thread)
+void mapWorker(ThreadContext* threadContext) {
+    // Stage 1: Each thread processes its own input pairs
+    int index = threadContext->job->next_input_index.fetch_add(1); // Use next_input_index
+    while (index < threadContext->job->inputVec.size()) {
+        K1* key = threadContext->job->inputVec[index].first;
+        V1* value = threadContext->job->inputVec[index].second;
+        try {
+            threadContext->job->client->map(key, value, threadContext);
+        } catch (const std::exception& e) {
+            threadContext->job->setJobState(stage_t::UNDEFINED_STAGE, 0, 0);
+            std::cerr << "Error in map function: " << e.what() << std::endl;
+            return;
+        }
+        threadContext->job->setJobState(stage_t::MAP_STAGE, threadContext->job->totalIntermediaryPairs.fetch_add(1), threadContext->job->inputVec.size());
+        index = threadContext->job->next_input_index.fetch_add(1);
+    }
+    // sorting the intermediate vector
+    std::sort(threadContext->intermediateVec.begin(), threadContext->intermediateVec.end(),
+              [](const auto& a, const auto& b) {
+                  return *(a.first) < *(b.first);
+              });
+    // waiting for all threads to finish sorting
+    threadContext->job->barrier.barrier(); 
+    // only the first thread will shuffle
+    if (threadContext->thread_id == 0) {
+        uint32_t processed = threadContext->job->totalIntermediaryPairs.load();
+        uint32_t expected = threadContext->job->inputVec.size();
+        if (processed != expected) {
+            std::cerr << "Warning: MAP_STAGE ended with mismatch. Processed = "
+                    << processed << ", Expected = " << expected << std::endl;
+        }
+        threadContext->job->setJobState(stage_t::SHUFFLE_STAGE, 0, processed);
+        shuffle(threadContext->job);
+    }
+    // waiting for all threads to finish shuffling
+    threadContext->job->barrier.barrier();
+    threadContext->job->atomicState.updateStage(stage_t::REDUCE_STAGE);
+    reduceWorker(threadContext);
+}
 
+void shuffle(JobContext* jobContext) {
+    // Queue to store vectors of identical keys
+    std::vector<IntermediateVec> shuffledQueue;
+    std::atomic<int> shuffledCount(0);
+    // While there are still elements in the intermediate vectors
+    while (true) {
+        bool allEmpty = true;
+        IntermediateVec currentVec;
 
+        // Iterate over each thread's intermediate vector
+        for (auto& intermediateVec : jobContext->intermediateVecsForReduce) {
+            if (intermediateVec.empty()) {
+                continue;
+            }
+
+            allEmpty = false;
+
+            // Take the last pair from the vector
+            auto& lastPair = intermediateVec.back();
+            K2* key = lastPair.first;
+            V2* value = lastPair.second;
+
+            // If the current vector is empty or the key changes, push the current vector to the queue
+            if (!currentVec.empty() && (*(currentVec.back().first) < *key || *key < *(currentVec.back().first))) {
+                shuffledQueue.push_back(std::move(currentVec));
+                shuffledCount.fetch_add(1);
+                jobContext->setJobState(stage_t::SHUFFLE_STAGE, shuffledCount.load(), jobContext->totalIntermediaryPairs.load());
+                currentVec.clear();
+            }
+
+            // Add the pair to the current vector
+            currentVec.emplace_back(key, value);
+            intermediateVec.pop_back();
+        }
+
+        // If all vectors are empty, push the last vector and break
+        if (allEmpty) {
+            if (!currentVec.empty()) {
+                shuffledQueue.push_back(std::move(currentVec));
+                shuffledCount.fetch_add(1);
+            }
+            break;
+        }
+    }
+
+    // Update the intermediate vectors for reduce
+    jobContext->intermediateVecsForReduce = std::move(shuffledQueue);
+}
+void reduceWorker(ThreadContext* threadContext) {
+    auto* jobContext = threadContext->job;
+
+    // שלב 0: שמור מראש את מספר הוקטורים לעיבוד (בצורה מסונכרנת)
+    size_t expectedTotal;
+    {
+        std::lock_guard<std::mutex> lock(jobContext->output_mutex);
+        expectedTotal = jobContext->intermediateVecsForReduce.size();
+    }
+
+    jobContext->setJobState(stage_t::REDUCE_STAGE, 0, expectedTotal);
+
+    while (true) {
+        IntermediateVec currentVec;
+        {
+            std::lock_guard<std::mutex> lock(jobContext->output_mutex);
+            if (jobContext->intermediateVecsForReduce.empty()) {
+                break; 
+            }
+
+            currentVec = std::move(jobContext->intermediateVecsForReduce.back());
+            jobContext->intermediateVecsForReduce.pop_back();
+        }
+        try {
+            jobContext->client->reduce(&currentVec, threadContext);
+        } catch (const std::exception& e) {
+            std::cerr << "Error in reduce function: " << e.what() << std::endl;
+            return;
+        }
+        int processed = jobContext->totalOutputPairs.fetch_add(1) + 1;
+        jobContext->setJobState(stage_t::REDUCE_STAGE, processed, expectedTotal);
+    }
+
+    jobContext->setJobState(stage_t::REDUCE_STAGE, jobContext->totalOutputPairs.load(), expectedTotal);
+}
