@@ -351,3 +351,4 @@ void reduceWorker(ThreadContext* threadContext) {
 
     jobContext->setJobState(stage_t::REDUCE_STAGE, jobContext->totalOutputPairs.load(), expectedTotal);
 }
+
