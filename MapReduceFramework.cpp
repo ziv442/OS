@@ -198,7 +198,7 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
     }
 
     // Initialize threadContexts and create threads
-    for (int i = 0; i < multiThreadLevel; ++i) {
+    for (std::size_t i = 0; i < multiThreadLevel; ++i) {
         if (i >= jobContext->threadContexts.size()) {
             std::cerr << "Error: Invalid thread context index." << std::endl;
             delete jobContext;
@@ -218,6 +218,53 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
     }
     return static_cast<JobHandle>(jobContext);
 }
+
+//
+//void mapWorker(ThreadContext* threadContext) {
+//    // Stage 1: Each thread processes its own input pairs
+//    int index = threadContext->job->next_input_index.fetch_add(1); // Use next_input_index
+//    while (index < threadContext->job->inputVec.size()) {
+//        K1* key = threadContext->job->inputVec[index].first;
+//        V1* value = threadContext->job->inputVec[index].second;
+//        try {
+//            threadContext->job->client->map(key, value, threadContext);
+//        } catch (const std::exception& e) {
+//            threadContext->job->setJobState(stage_t::UNDEFINED_STAGE, 0, 0);
+//            std::cerr << "Error in map function: " << e.what() << std::endl;
+//            return;
+//        }
+//        int processed = index + 1;
+//        threadContext->job->setJobState(stage_t::MAP_STAGE, processed, threadContext->job->inputVec.size());
+//        index = threadContext->job->next_input_index.fetch_add(1);
+//    }
+//    // sorting the intermediate vector
+//    std::sort(threadContext->intermediateVec.begin(), threadContext->intermediateVec.end(),
+//              [](const auto& a, const auto& b) {
+//                  return *(a.first) < *(b.first);
+//              });
+//    {
+//    std::lock_guard<std::mutex> lock(threadContext->job->output_mutex);
+//    threadContext->job->intermediateVecsForReduce[ threadContext->thread_id ] = std::move(threadContext->intermediateVec);
+//    }
+//
+//    // waiting for all threads to finish sorting
+//    threadContext->job->barrier.barrier();
+//    // only the first thread will shuffle
+//    if (threadContext->thread_id == 0) {
+//        uint32_t processed = threadContext->job->totalIntermediaryPairs.load();
+//        uint32_t expected = threadContext->job->inputVec.size();
+//        if (processed != expected) {
+//            std::cerr << "Warning: MAP_STAGE ended with mismatch. Processed = "
+//                    << processed << ", Expected = " << expected << std::endl;
+//        }
+//        threadContext->job->setJobState(stage_t::SHUFFLE_STAGE, 0, processed);
+//        shuffle(threadContext->job);
+//    }
+//    // waiting for all threads to finish shuffling
+//    threadContext->job->barrier.barrier();
+//    threadContext->job->atomicState.updateStage(stage_t::REDUCE_STAGE);
+//    reduceWorker(threadContext);
+//}
 
 
 void mapWorker(ThreadContext* threadContext) {
@@ -248,16 +295,21 @@ void mapWorker(ThreadContext* threadContext) {
     }
 
     // waiting for all threads to finish sorting
-    threadContext->job->barrier.barrier(); 
+    threadContext->job->barrier.barrier();
     // only the first thread will shuffle
     if (threadContext->thread_id == 0) {
-        uint32_t processed = threadContext->job->totalIntermediaryPairs.load();
-        uint32_t expected = threadContext->job->inputVec.size();
-        if (processed != expected) {
-            std::cerr << "Warning: MAP_STAGE ended with mismatch. Processed = "
-                    << processed << ", Expected = " << expected << std::endl;
+        uint32_t sum = 0;
+        for (auto &vec : threadContext->job->intermediateVecsForReduce) {
+            sum += vec.size();
         }
-        threadContext->job->setJobState(stage_t::SHUFFLE_STAGE, 0, processed);
+        uint32_t total = threadContext->job->totalIntermediaryPairs.load();
+        if (sum != total) {
+            std::cerr << "Sanity check FAILED in MAP_STAGE: "
+                  << "sum(vec sizes)=" << sum
+                  << ", totalIntermediaryPairs=" << total
+                  << std::endl;
+    }
+        threadContext->job->setJobState(stage_t::SHUFFLE_STAGE, 0, total);
         shuffle(threadContext->job);
     }
     // waiting for all threads to finish shuffling
@@ -345,7 +397,7 @@ void reduceWorker(ThreadContext* threadContext) {
             std::cerr << "Error in reduce function: " << e.what() << std::endl;
             return;
         }
-        int processed = jobContext->totalOutputPairs.fetch_add(1) + 1;
+        uint32_t processed = jobContext->totalOutputPairs.load();  // instead of incrementing again
         jobContext->setJobState(stage_t::REDUCE_STAGE, processed, expectedTotal);
     }
 
