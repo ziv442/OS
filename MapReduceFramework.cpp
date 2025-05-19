@@ -7,6 +7,7 @@
 #include <iostream>
 #include <atomic>
 #include <cstdint>
+#include <algorithm>
 
 
 using IntermediateVec = std::vector<std::pair<K2*,V2*>>;
@@ -22,7 +23,6 @@ class JobStateAtomic {
 /// counts are changed without race conditions.
 private:
     std::atomic<uint64_t> packed;  // Stores everything
-
 public:
     JobStateAtomic() : packed(0) {} // constructor initializes packed to 0
 
@@ -71,7 +71,6 @@ struct ThreadContext {
     JobContext* job; // Pointer to the job context
     int thread_id;   // Thread ID
     IntermediateVec intermediateVec; // Vector for intermediate key-value pairs
-    std::mutex mutex; // Mutex for thread safety
 };
 
 struct JobContext {
@@ -79,11 +78,12 @@ struct JobContext {
 // used internally to manage the job.
     const MapReduceClient* client; // Pointer to the client
     Barrier barrier; // to wait until shuffling is done
+    Barrier barrierShuffle;// Barrier to synchronize threads
     std::vector<std::thread> threads;
     std::vector<IntermediateVec> intermediateVecsForReduce; // vector of vectors - make sure it contains a sequence of pairs (k2, v2) where all keys are identical
     std::mutex join_mutex;      // Protects joining logic
-    bool joined = false;        // Indicates if threads were already joined (indicates if the job is finished)
-    bool is_deleted = false;  // Indicates if the job context is deleted
+    bool joined ;        // Indicates if threads were already joined (indicates if the job is finished)
+    bool is_deleted ;  // Indicates if the job context is deleted
     std::mutex delete_mutex;  // Protects deletion logic
     InputVec inputVec;
     OutputVec* outputVec;
@@ -92,7 +92,10 @@ struct JobContext {
     std::mutex output_mutex;
     std::atomic<int> totalIntermediaryPairs;
     std::atomic<int> totalOutputPairs;
+    std::atomic<int> reducedGroupsCounter;
+    std::atomic<int> shuffledCount; // Number of shuffled groups
     std::vector<ThreadContext> threadContexts;
+
 
     // Helper to get the current JobState
     JobState getJobState() {
@@ -109,13 +112,16 @@ struct JobContext {
 JobContext(const MapReduceClient* client, const InputVec& inputVec, OutputVec* outputVec, int multiThreadLevel)
     : client(client),
       barrier(multiThreadLevel),
-      inputVec(std::move(inputVec)),
-      outputVec(outputVec),
-      next_input_index(0),
+      barrierShuffle(multiThreadLevel),
       joined(false),
       is_deleted(false),
+      inputVec(inputVec),
+      outputVec(outputVec),
+      next_input_index(0),
       totalIntermediaryPairs(0),
       totalOutputPairs(0),
+      reducedGroupsCounter(0),
+      shuffledCount(0),
       threadContexts(multiThreadLevel)
     {
     // Initialize the job state
@@ -196,76 +202,24 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
         std::cerr << "Error: Failed to allocate memory for JobContext." << std::endl;
         return nullptr;
     }
-
-    // Initialize threadContexts and create threads
+    // Ensure threadContexts vector is correctly sized
+    jobContext->threadContexts.resize(multiThreadLevel);
+    // Create and launch worker threads
     for (std::size_t i = 0; i < multiThreadLevel; ++i) {
-        if (i >= jobContext->threadContexts.size()) {
-            std::cerr << "Error: Invalid thread context index." << std::endl;
-            delete jobContext;
-            return nullptr;
-        }
         jobContext->threadContexts[i].job = jobContext;
-        jobContext->threadContexts[i].thread_id = i;
-
+        jobContext->threadContexts[i].thread_id = static_cast<int>(i);
         try {
             jobContext->threads.emplace_back(mapWorker, &jobContext->threadContexts[i]);
         } catch (const std::system_error& e) {
-            std::cerr << "Error: Failed to create thread " << i << ": " << e.what() << std::endl;
+            std::cerr << "system error: " << e.what() << std::endl;
             waitForJob(static_cast<JobHandle>(jobContext));
             delete jobContext;
-            return nullptr;
-        }
+            exit(1); // Exit if thread creation fails
+}
+
     }
     return static_cast<JobHandle>(jobContext);
 }
-
-//
-//void mapWorker(ThreadContext* threadContext) {
-//    // Stage 1: Each thread processes its own input pairs
-//    int index = threadContext->job->next_input_index.fetch_add(1); // Use next_input_index
-//    while (index < threadContext->job->inputVec.size()) {
-//        K1* key = threadContext->job->inputVec[index].first;
-//        V1* value = threadContext->job->inputVec[index].second;
-//        try {
-//            threadContext->job->client->map(key, value, threadContext);
-//        } catch (const std::exception& e) {
-//            threadContext->job->setJobState(stage_t::UNDEFINED_STAGE, 0, 0);
-//            std::cerr << "Error in map function: " << e.what() << std::endl;
-//            return;
-//        }
-//        int processed = index + 1;
-//        threadContext->job->setJobState(stage_t::MAP_STAGE, processed, threadContext->job->inputVec.size());
-//        index = threadContext->job->next_input_index.fetch_add(1);
-//    }
-//    // sorting the intermediate vector
-//    std::sort(threadContext->intermediateVec.begin(), threadContext->intermediateVec.end(),
-//              [](const auto& a, const auto& b) {
-//                  return *(a.first) < *(b.first);
-//              });
-//    {
-//    std::lock_guard<std::mutex> lock(threadContext->job->output_mutex);
-//    threadContext->job->intermediateVecsForReduce[ threadContext->thread_id ] = std::move(threadContext->intermediateVec);
-//    }
-//
-//    // waiting for all threads to finish sorting
-//    threadContext->job->barrier.barrier();
-//    // only the first thread will shuffle
-//    if (threadContext->thread_id == 0) {
-//        uint32_t processed = threadContext->job->totalIntermediaryPairs.load();
-//        uint32_t expected = threadContext->job->inputVec.size();
-//        if (processed != expected) {
-//            std::cerr << "Warning: MAP_STAGE ended with mismatch. Processed = "
-//                    << processed << ", Expected = " << expected << std::endl;
-//        }
-//        threadContext->job->setJobState(stage_t::SHUFFLE_STAGE, 0, processed);
-//        shuffle(threadContext->job);
-//    }
-//    // waiting for all threads to finish shuffling
-//    threadContext->job->barrier.barrier();
-//    threadContext->job->atomicState.updateStage(stage_t::REDUCE_STAGE);
-//    reduceWorker(threadContext);
-//}
-
 
 void mapWorker(ThreadContext* threadContext) {
     // Stage 1: Each thread processes its own input pairs
@@ -281,7 +235,7 @@ void mapWorker(ThreadContext* threadContext) {
             return;
         }
         int processed = index + 1;
-        threadContext->job->setJobState(stage_t::MAP_STAGE, processed, threadContext->job->inputVec.size());
+        threadContext->job->atomicState.updateProcessed(processed);
         index = threadContext->job->next_input_index.fetch_add(1);
     }
     // sorting the intermediate vector
@@ -309,75 +263,77 @@ void mapWorker(ThreadContext* threadContext) {
                   << ", totalIntermediaryPairs=" << total
                   << std::endl;
     }
-        threadContext->job->setJobState(stage_t::SHUFFLE_STAGE, 0, total);
+//        threadContext->job->setJobState(stage_t::SHUFFLE_STAGE, 0, total);
         shuffle(threadContext->job);
     }
     // waiting for all threads to finish shuffling
-    threadContext->job->barrier.barrier();
-    threadContext->job->atomicState.updateStage(stage_t::REDUCE_STAGE);
+    threadContext->job->barrierShuffle.barrier();
     reduceWorker(threadContext);
 }
 
 void shuffle(JobContext* jobContext) {
-    // Queue to store vectors of identical keys
-    std::vector<IntermediateVec> shuffledQueue;
-    std::atomic<int> shuffledCount(0);
-    IntermediateVec currentVec; ////// changed this!!!!!!
+    auto& vecs = jobContext->intermediateVecsForReduce;
+    std::vector<IntermediateVec> shuffledGroups;
 
-    // While there are still elements in the intermediate vectors
+    std::atomic<int>& shuffledCount = jobContext->shuffledCount;
+    std::atomic<int> shuffledPairsCount(0);
+    int totalPairs = jobContext->totalIntermediaryPairs.load();
+
+    jobContext->setJobState(stage_t::SHUFFLE_STAGE, 0, totalPairs);
+
     while (true) {
-        bool allEmpty = true;
+        K2* maxKey = nullptr;
 
-        // Iterate over each thread's intermediate vector
-        for (auto& intermediateVec : jobContext->intermediateVecsForReduce) {
-            if (intermediateVec.empty()) {
-                continue;
+        for (const auto& vec : vecs) {
+            if (!vec.empty()) {
+                K2* candidate = vec.back().first;
+                if (!maxKey || *maxKey < *candidate) {
+                    maxKey = candidate;
+                }
             }
-
-            allEmpty = false;
-
-            // Take the last pair from the vector
-            auto& lastPair = intermediateVec.back();
-            K2* key = lastPair.first;
-            V2* value = lastPair.second;
-
-            // If the current vector is empty or the key changes, push the current vector to the queue
-            if (!currentVec.empty() && (*(currentVec.back().first) < *key || *key < *(currentVec.back().first))) {
-                shuffledQueue.push_back(std::move(currentVec));
-                shuffledCount.fetch_add(1);
-                jobContext->setJobState(stage_t::SHUFFLE_STAGE, shuffledCount.load(), jobContext->totalIntermediaryPairs.load());
-                currentVec.clear();
-            }
-
-            // Add the pair to the current vector
-            currentVec.emplace_back(key, value);
-            intermediateVec.pop_back();
         }
 
-        // If all vectors are empty, push the last vector and break
-        if (allEmpty) {
-            if (!currentVec.empty()) {
-                shuffledQueue.push_back(std::move(currentVec));
-                shuffledCount.fetch_add(1);
-            }
+        if (!maxKey) {
             break;
         }
+
+        IntermediateVec group;
+
+        for (auto& vec : vecs) {
+            while (!vec.empty()) {
+                K2* currentKey = vec.back().first;
+                if (!(*currentKey < *maxKey) && !(*maxKey < *currentKey)) {
+                    group.push_back(std::move(vec.back()));
+                    vec.pop_back();
+                } else {
+                    break;  // עברנו את maxKey הנוכחי, וקטור מסודר
+                }
+            }
+        }
+
+        int groupSize = group.size();
+        shuffledPairsCount += groupSize;
+        shuffledGroups.push_back(std::move(group));
+        shuffledCount.fetch_add(1);
+        jobContext->atomicState.updateProcessed(shuffledPairsCount.load());
     }
 
-    // Update the intermediate vectors for reduce
-    jobContext->intermediateVecsForReduce = std::move(shuffledQueue);
+    jobContext->intermediateVecsForReduce = std::move(shuffledGroups);
+
+    jobContext->atomicState.updateProcessed(shuffledPairsCount.load());
 }
+
+
+
 
 void reduceWorker(ThreadContext* threadContext) {
     auto* jobContext = threadContext->job;
-
-    // שלב 0: שמור מראש את מספר הוקטורים לעיבוד (בצורה מסונכרנת)
     size_t expectedTotal;
     {
         std::lock_guard<std::mutex> lock(jobContext->output_mutex);
-        expectedTotal = jobContext->intermediateVecsForReduce.size();
+        expectedTotal = jobContext->shuffledCount.load();
     }
-
+    
     jobContext->setJobState(stage_t::REDUCE_STAGE, 0, expectedTotal);
 
     while (true) {
@@ -391,16 +347,15 @@ void reduceWorker(ThreadContext* threadContext) {
             currentVec = std::move(jobContext->intermediateVecsForReduce.back());
             jobContext->intermediateVecsForReduce.pop_back();
         }
+
         try {
             jobContext->client->reduce(&currentVec, threadContext);
         } catch (const std::exception& e) {
             std::cerr << "Error in reduce function: " << e.what() << std::endl;
             return;
         }
-        uint32_t processed = jobContext->totalOutputPairs.load();  // instead of incrementing again
-        jobContext->setJobState(stage_t::REDUCE_STAGE, processed, expectedTotal);
+        uint32_t processedGroups = jobContext->reducedGroupsCounter.fetch_add(1) + 1;
+        jobContext->atomicState.updateProcessed(processedGroups);
     }
-
-    jobContext->setJobState(stage_t::REDUCE_STAGE, jobContext->totalOutputPairs.load(), expectedTotal);
+    jobContext->setJobState(stage_t::REDUCE_STAGE, jobContext->reducedGroupsCounter.load(), expectedTotal);
 }
-
